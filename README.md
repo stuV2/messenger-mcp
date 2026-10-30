@@ -34,7 +34,7 @@ MESSENGER_PACKAGING_PYTHON=/opt/homebrew/bin/python3.12 \
   ./scripts/install-macos.sh install \
   --binary '/absolute/path/to/reviewed/messenger-mcp' \
   --sha256 APPROVED_LOWERCASE_SHA256 --version APPROVED_RELEASE_ID \
-  --expect-user Zelda --expect-host APPROVED_EXACT_HOSTNAME --expect-arch arm64 \
+  --expect-user YOUR_LOGIN_USER --expect-host APPROVED_EXACT_HOSTNAME --expect-arch arm64 \
   --no-autostart --dry-run
 ```
 
