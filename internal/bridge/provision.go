@@ -106,27 +106,26 @@ func (c *Client) do(ctx context.Context, method, path string, body any, out any)
 	}
 	resp, err := c.httpClient().Do(req)
 	if err != nil {
-		return fmt.Errorf("bridge unreachable: %w", err)
+		return fmt.Errorf("bridge request failed; upstream diagnostics withheld")
 	}
 	defer resp.Body.Close()
-	data, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	data, err := io.ReadAll(io.LimitReader(resp.Body, (1<<20)+1))
 	if err != nil {
-		return err
+		return fmt.Errorf("bridge response could not be read")
+	}
+	if len(data) > 1<<20 {
+		return fmt.Errorf("bridge response exceeds limit")
 	}
 	if resp.StatusCode >= 300 {
-		var e struct {
-			Code  string `json:"errcode"`
-			Error string `json:"error"`
-		}
-		if json.Unmarshal(data, &e) == nil && e.Error != "" {
-			return fmt.Errorf("bridge: %s (%s)", e.Error, e.Code)
-		}
 		return fmt.Errorf("bridge: HTTP %d", resp.StatusCode)
 	}
 	if out == nil {
 		return nil
 	}
-	return json.Unmarshal(data, out)
+	if err := json.Unmarshal(data, out); err != nil {
+		return fmt.Errorf("invalid bridge response")
+	}
+	return nil
 }
 
 func (c *Client) Flows(ctx context.Context) ([]Flow, error) {
@@ -181,12 +180,10 @@ func (c *Client) Status(ctx context.Context) (LoginStatus, error) {
 		return LoginStatus{State: StateNotLoggedIn, BridgeBot: r.BridgeBot}, nil
 	}
 	l := r.Logins[0]
-	st := LoginStatus{RawState: l.State.Event, LoginID: l.ID, Name: l.Name, BridgeBot: r.BridgeBot, Error: l.State.Message}
-	if st.Error == "" {
-		st.Error = l.State.Error
-	}
+	st := LoginStatus{LoginID: l.ID, Name: l.Name, BridgeBot: r.BridgeBot, Error: "provider diagnostics withheld"}
 	switch l.State.Event {
-	case "CONNECTED", "BACKFILLING":
+	case "CONNECTED":
+		st.RawState = "CONNECTED"
 		st.State = StateConnected
 		st.Error = ""
 	case "BAD_CREDENTIALS", "LOGGED_OUT":

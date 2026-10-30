@@ -53,17 +53,21 @@ func setup(t *testing.T) (*server.MCPServer, *ledger.Ledger, *fakeReads, string)
 	downloads := filepath.Join(dir, "downloads")
 	os.MkdirAll(uploads, 0o700)
 	os.MkdirAll(downloads, 0o700)
-	q, err := outbox.New(l, nopSender{}, outbox.Config{MinGap: time.Second, StatusTimeout: time.Minute, DailyMax: 10, UploadsDir: uploads, MaxFileBytes: 1 << 20})
+	q, err := outbox.New(l, nopSender{}, outbox.Config{WritesEnabled: true, MinGap: time.Second, StatusTimeout: time.Minute, DailyMax: 10, UploadsDir: uploads, MaxFileBytes: 1 << 20})
 	if err != nil {
 		t.Fatal(err)
 	}
 	reads := &fakeReads{}
 	s := server.NewMCPServer("messenger", "test", server.WithToolCapabilities(true))
-	Register(s, Deps{
+	// Preserve synthetic legacy helper coverage. This is deliberately not the
+	// production Register path, which is tested separately in hardening_test.go.
+	d := Deps{BodyAccessEnabled: true, WritesEnabled: true,
 		L: l, Q: q, Media: fakeMedia{}, Reads: reads, DownloadsDir: downloads, UploadsDir: uploads,
 		SendWait: 10 * time.Millisecond,
 		Status:   func(context.Context) map[string]any { return map[string]any{"bridge": "connected"} },
-	})
+	}
+	registerRead(s, d)
+	registerSend(s, d)
 	return s, l, reads, downloads
 }
 
@@ -113,7 +117,7 @@ func TestToolsList(t *testing.T) {
 	var names []string
 	for _, tl := range list.Tools {
 		names = append(names, tl.Name)
-		if tl.Name == "send_message" && !strings.Contains(tl.Description, "autoriz") {
+		if tl.Name == "send_message" && !strings.Contains(tl.Description, "approval") {
 			t.Fatalf("send_message must require explicit authorization: %s", tl.Description)
 		}
 	}

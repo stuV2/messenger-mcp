@@ -1,19 +1,12 @@
 package daemon
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
-	"image"
-	_ "image/gif"
-	_ "image/jpeg"
-	_ "image/png"
+	"io"
 	"log/slog"
-	"mime"
 	"net/http"
-	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -84,10 +77,10 @@ func classify(err error) error {
 	var he mautrix.HTTPError
 	if errors.As(err, &he) && he.Response != nil {
 		if c := he.Response.StatusCode; c >= 400 && c < 500 && c != http.StatusTooManyRequests {
-			return outbox.Permanent(err)
+			return outbox.Permanent(errors.New("Matrix request rejected"))
 		}
 	}
-	return err
+	return errors.New("Matrix request failed; upstream diagnostics withheld")
 }
 
 // syncStore persists next_batch one sync late, so a crash re-processes the
@@ -136,17 +129,7 @@ type Matrix struct {
 }
 
 func NewMatrix(cfg Config, l *ledger.Ledger, log *slog.Logger) (*Matrix, error) {
-	cli, err := mautrix.NewClient(cfg.Homeserver, id.UserID(cfg.UserID), "")
-	if err != nil {
-		return nil, err
-	}
-	cli.Store = &syncStore{l: l}
-	m := &Matrix{cli: cli, l: l, password: cfg.Password, log: log, bot: id.UserID(cfg.BridgeBot), names: map[string]string{}}
-	m.joins = newJoiner(func(ctx context.Context, roomID id.RoomID) error {
-		_, err := cli.JoinRoomByID(ctx, roomID)
-		return err
-	}, log)
-	return m, nil
+	return nil, errors.New("source capture is blocked pending separate privacy approval")
 }
 
 // inviteFilter keeps the full /sync used for invite reconciliation small.
@@ -266,7 +249,7 @@ func (m *Matrix) onSync(ctx context.Context, res *mautrix.RespSync, _ string) bo
 
 func (m *Matrix) setErr(err error) {
 	m.mu.Lock()
-	m.lastErr = err.Error()
+	m.lastErr = "Matrix request failed; upstream diagnostics withheld"
 	m.mu.Unlock()
 }
 
@@ -281,10 +264,10 @@ func (m *Matrix) Run(ctx context.Context) {
 	for ctx.Err() == nil {
 		if err := m.login(ctx); err != nil {
 			m.setErr(err)
-			m.log.Warn("matrix not ready", "error", err)
+			m.log.Warn("matrix not ready; upstream diagnostics withheld")
 		} else if err := m.syncOnce(ctx); err != nil && ctx.Err() == nil {
 			m.setErr(err)
-			m.log.Warn("matrix sync stopped", "error", err)
+			m.log.Warn("matrix sync stopped; upstream diagnostics withheld")
 			if errors.Is(err, mautrix.MUnknownToken) {
 				_ = m.l.SetSync(ctx, "access_token", "")
 			}
@@ -347,51 +330,14 @@ func (m *Matrix) Name(ctx context.Context, roomID id.RoomID, userID id.UserID) s
 }
 
 func (m *Matrix) SendText(ctx context.Context, roomID, txnID, text string) (string, error) {
-	resp, err := m.cli.SendMessageEvent(ctx, id.RoomID(roomID), event.EventMessage,
-		&event.MessageEventContent{MsgType: event.MsgText, Body: text}, mautrix.ReqSendEvent{TransactionID: txnID})
-	if err != nil {
-		return "", classify(err)
-	}
-	return string(resp.EventID), nil
+	return "", outbox.Permanent(errors.New("read-only service: sends are disabled"))
 }
 
 var msgTypes = map[string]event.MessageType{"image": event.MsgImage, "video": event.MsgVideo, "audio": event.MsgAudio}
 
 func (m *Matrix) SendFile(ctx context.Context, roomID, txnID, path, caption string) (string, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return "", outbox.Permanent(err)
-	}
-	name := filepath.Base(path)
-	mimeType := mime.TypeByExtension(strings.ToLower(filepath.Ext(name)))
-	if mimeType == "" {
-		mimeType = http.DetectContentType(data)
-	}
-	up, err := m.cli.UploadBytesWithName(ctx, data, mimeType, name)
-	if err != nil {
-		return "", classify(err)
-	}
-	msgType, ok := msgTypes[strings.SplitN(mimeType, "/", 2)[0]]
-	if !ok {
-		msgType = event.MsgFile
-	}
-	content := &event.MessageEventContent{
-		MsgType: msgType, Body: name, FileName: name, URL: up.ContentURI.CUString(),
-		Info: &event.FileInfo{MimeType: mimeType, Size: len(data)},
-	}
-	if caption != "" {
-		content.Body = caption
-	}
-	if msgType == event.MsgImage {
-		if cfg, _, err := image.DecodeConfig(bytes.NewReader(data)); err == nil {
-			content.Info.Width, content.Info.Height = cfg.Width, cfg.Height
-		}
-	}
-	resp, err := m.cli.SendMessageEvent(ctx, id.RoomID(roomID), event.EventMessage, content, mautrix.ReqSendEvent{TransactionID: txnID})
-	if err != nil {
-		return "", classify(err)
-	}
-	return string(resp.EventID), nil
+	// A validated pathname is not immutable approved content. Never reopen it.
+	return "", outbox.Permanent(errors.New("file sending is disabled until immutable bounded upload snapshots are implemented"))
 }
 
 func (m *Matrix) Download(ctx context.Context, mxc string) ([]byte, string, error) {
@@ -399,13 +345,25 @@ func (m *Matrix) Download(ctx context.Context, mxc string) ([]byte, string, erro
 	if err != nil {
 		return nil, "", err
 	}
-	data, err := m.cli.DownloadBytes(ctx, uri)
+	resp, err := m.cli.Download(ctx, uri)
 	if err != nil {
-		return nil, "", err
+		return nil, "", errors.New("attachment download failed")
+	}
+	defer resp.Body.Close()
+	const limit = 25 << 20
+	if resp.ContentLength > limit {
+		return nil, "", errors.New("attachment exceeds 25 MiB limit")
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
+	if err != nil {
+		return nil, "", errors.New("attachment download failed")
+	}
+	if len(data) > limit {
+		return nil, "", errors.New("attachment exceeds 25 MiB limit")
 	}
 	return data, http.DetectContentType(data), nil
 }
 
 func (m *Matrix) MarkRead(ctx context.Context, roomID, eventID string) error {
-	return m.cli.MarkRead(ctx, id.RoomID(roomID), id.EventID(eventID))
+	return errors.New("read-only service: read receipts are disabled")
 }

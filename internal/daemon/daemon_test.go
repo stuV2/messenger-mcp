@@ -34,17 +34,21 @@ const goodSecrets = `# comment
 MATRIX_PASSWORD=pw
 BRIDGE_PROVISIONING_SECRET="bridge secret"
 INTERNAL_SECRET=internal
+MCP_TOKEN=synthetic-test-token-32-bytes-long-xxxx
 `
 
 func TestLoadConfigDefaultsAndValidation(t *testing.T) {
 	dir := t.TempDir()
+	if err := os.Chmod(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
 	writeSecrets(t, dir, goodSecrets, 0o600)
 	c, err := LoadConfig(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if c.Listen != "127.0.0.1:7381" || c.Homeserver != "http://127.0.0.1:7382" || c.BridgeURL != "http://127.0.0.1:7383" ||
-		c.UserID != "@jesus:messenger.local" || c.BridgeBot != "@metabot:messenger.local" || c.BridgeSecret != "bridge secret" {
+		c.UserID != "@operator:messenger.local" || c.BridgeBot != "@metabot:messenger.local" || c.BridgeSecret != "bridge secret" {
 		t.Fatalf("config %+v", c)
 	}
 	if c.UploadsDir != filepath.Join(dir, "uploads") || c.DownloadsDir != filepath.Join(dir, "downloads") {
@@ -56,7 +60,7 @@ func TestLoadConfigDefaultsAndValidation(t *testing.T) {
 		t.Fatalf("world-readable secrets must be refused: %v", err)
 	}
 	writeSecrets(t, dir, "MATRIX_PASSWORD=pw\n", 0o600)
-	if _, err := LoadConfig(dir); err == nil || !strings.Contains(err.Error(), "BRIDGE_PROVISIONING_SECRET") {
+	if _, err := LoadConfig(dir); err == nil || !strings.Contains(err.Error(), "MCP_TOKEN") {
 		t.Fatalf("missing secret must be named: %v", err)
 	}
 	writeSecrets(t, dir, goodSecrets+"LISTEN=0.0.0.0:7381\n", 0o600)

@@ -393,6 +393,41 @@ func (l *Ledger) ListChats(ctx context.Context, query string, unreadOnly bool, l
 	return out, rows.Err()
 }
 
+// ChatMetadata never selects message bodies, attachment names or media URLs.
+type ChatMetadata struct {
+	ChatID string `json:"chat_id"`
+	Name   string `json:"name"`
+	IsDM   bool   `json:"is_dm"`
+	Unread int    `json:"unread_local"`
+}
+
+// ListChatMetadata is keyset-paginated by stable chat ID, not a shifting offset.
+// Counts are local ledger heuristics, not authoritative Messenger unread state.
+func (l *Ledger) ListChatMetadata(ctx context.Context, query string, unreadOnly bool, after string, limit int) ([]ChatMetadata, error) {
+	if limit < 1 || limit > 101 {
+		return nil, errors.New("metadata page limit must be 1 to 101")
+	}
+	rows, err := l.db.QueryContext(ctx, `SELECT * FROM (
+ SELECT c.chat_id,c.name,c.is_dm,
+ (SELECT COUNT(*) FROM messages x WHERE x.chat_id=c.chat_id AND x.own=0 AND x.deleted=0
+ AND x.ts>MAX(c.read_upto_ts,COALESCE((SELECT MAX(y.ts) FROM messages y WHERE y.chat_id=c.chat_id AND y.own=1),0))) AS unread
+ FROM chats c WHERE c.chat_id>? AND c.name_norm LIKE ?
+ ) WHERE (?=0 OR unread>0) ORDER BY chat_id LIMIT ?`, after, "%"+Fold(query)+"%", unreadOnly, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []ChatMetadata{}
+	for rows.Next() {
+		var c ChatMetadata
+		if err := rows.Scan(&c.ChatID, &c.Name, &c.IsDM, &c.Unread); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
 // MarkRead records a read point and returns the newest message to acknowledge.
 func (l *Ledger) MarkRead(ctx context.Context, chatID string) (string, string, error) {
 	c, err := l.ChatByID(ctx, chatID)

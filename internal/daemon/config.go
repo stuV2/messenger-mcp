@@ -1,5 +1,4 @@
-// Package daemon wires the ledger, Matrix sync, send queue, pairing page and
-// MCP tools into the messenger-mcp service.
+// Package daemon runs the capture-disabled stuV2 Messenger MCP fork.
 package daemon
 
 import (
@@ -7,31 +6,45 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 )
 
 type Config struct {
-	DataDir        string
-	Listen         string
-	Homeserver     string
-	UserID         string
-	Password       string
-	BridgeURL      string
-	BridgeSecret   string
-	BridgeBot      string
-	InternalSecret string
-	UploadsDir     string
-	DownloadsDir   string
+	DataDir, Listen, Homeserver, UserID, Password      string
+	BridgeURL, BridgeSecret, BridgeBot, InternalSecret string
+	MCPToken                                           string
+	UploadsDir, DownloadsDir                           string
+	SyncEnabled, PairingEnabled, WritesEnabled         bool
 }
 
-// BaseURL is the loopback URL the service is reachable on.
 func (c Config) BaseURL() string { return "http://" + c.Listen }
-
 func DefaultDataDir() string {
 	home, _ := os.UserHomeDir()
-	return filepath.Join(home, "Library", "Application Support", "messenger-mcp")
+	return filepath.Join(home, "Library", "Application Support", "messenger-mcp-stuv2")
+}
+
+// privatePath refuses symlinks, other owners and group/world permissions.
+// Existing data is never silently chmodded into apparent compliance.
+func privatePath(path string, directory bool) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || info.IsDir() != directory || (!directory && !info.Mode().IsRegular()) {
+		return errors.New("private data paths must be real directories or regular files, not symlinks")
+	}
+	if info.Mode().Perm()&0o077 != 0 {
+		return errors.New("private directories require mode 700 and files mode 600")
+	}
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || st.Uid != uint32(os.Geteuid()) {
+		return errors.New("private data must be owned by the current user")
+	}
+	return nil
 }
 
 func readEnv(path string) (map[string]string, error) {
@@ -60,19 +73,53 @@ func readEnv(path string) (map[string]string, error) {
 	return out, sc.Err()
 }
 
-// LoadConfig reads <dataDir>/secrets.env, which must not be readable by other users.
-func LoadConfig(dataDir string) (Config, error) {
-	path := filepath.Join(dataDir, "secrets.env")
-	info, err := os.Stat(path)
-	if err != nil {
-		return Config{}, fmt.Errorf("secrets: %w", err)
+func localEndpoint(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme != "http" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || (u.Path != "" && u.Path != "/") {
+		return false
 	}
-	if info.Mode().Perm()&0o077 != 0 {
-		return Config{}, fmt.Errorf("%s must have mode 600 (it is %o)", path, info.Mode().Perm())
+	return (u.Hostname() == "localhost" || isLoopbackIP(u.Hostname())) && u.Port() != ""
+}
+
+func (c Config) Validate() error {
+	if len(c.MCPToken) < 32 || len(c.MCPToken) > 4096 || strings.ContainsAny(c.MCPToken, " \t\r\n") {
+		return errors.New("MCP_TOKEN must be 32 to 4096 bytes without whitespace")
+	}
+	if c.MCPToken == c.InternalSecret || c.MCPToken == c.BridgeSecret || c.MCPToken == c.Password {
+		return errors.New("MCP_TOKEN must be separate from pairing and provider secrets")
+	}
+	host, port, err := net.SplitHostPort(c.Listen)
+	if err != nil || !isLoopbackIP(host) || port == "" {
+		return errors.New("LISTEN must be a loopback IP and port")
+	}
+	if c.SyncEnabled || c.PairingEnabled || c.WritesEnabled {
+		return errors.New("capture, pairing and writes are blocked pending a separately approved source privacy design")
+	}
+	if !localEndpoint(c.Homeserver) || !localEndpoint(c.BridgeURL) {
+		return errors.New("Matrix and bridge endpoints must be explicit loopback HTTP URLs")
+	}
+	abs, err := filepath.Abs(c.DataDir)
+	if err != nil || !filepath.IsAbs(c.DataDir) {
+		return errors.New("data directory must be an absolute path")
+	}
+	real, err := filepath.EvalSymlinks(abs)
+	if err != nil || real != filepath.Clean(abs) {
+		return errors.New("data directory must not contain symlink components")
+	}
+	return privatePath(c.DataDir, true)
+}
+
+func LoadConfig(dataDir string) (Config, error) {
+	if err := privatePath(dataDir, true); err != nil {
+		return Config{}, fmt.Errorf("data directory: %w", err)
+	}
+	path := filepath.Join(dataDir, "secrets.env")
+	if err := privatePath(path, false); err != nil {
+		return Config{}, errors.New("secrets file is missing or unsafe; require a private owned regular file with mode 600")
 	}
 	env, err := readEnv(path)
 	if err != nil {
-		return Config{}, err
+		return Config{}, errors.New("cannot read secrets configuration")
 	}
 	get := func(k, def string) string {
 		if v := env[k]; v != "" {
@@ -80,34 +127,18 @@ func LoadConfig(dataDir string) (Config, error) {
 		}
 		return def
 	}
-	c := Config{
-		DataDir:        dataDir,
-		Listen:         get("LISTEN", "127.0.0.1:7381"),
-		Homeserver:     get("MATRIX_HOMESERVER", "http://127.0.0.1:7382"),
-		UserID:         get("MATRIX_USER_ID", "@jesus:messenger.local"),
-		Password:       env["MATRIX_PASSWORD"],
-		BridgeURL:      get("BRIDGE_URL", "http://127.0.0.1:7383"),
-		BridgeSecret:   env["BRIDGE_PROVISIONING_SECRET"],
-		BridgeBot:      get("BRIDGE_BOT", "@metabot:messenger.local"),
-		InternalSecret: env["INTERNAL_SECRET"],
-		UploadsDir:     filepath.Join(dataDir, "uploads"),
-		DownloadsDir:   filepath.Join(dataDir, "downloads"),
-	}
-	var missing []string
-	for k, v := range map[string]string{"MATRIX_PASSWORD": c.Password, "BRIDGE_PROVISIONING_SECRET": c.BridgeSecret, "INTERNAL_SECRET": c.InternalSecret} {
-		if v == "" {
-			missing = append(missing, k)
+	// Reject unknown/non-false enable values rather than accidentally enabling capture.
+	for _, k := range []string{"SYNC_ENABLED", "PAIRING_ENABLED", "WRITES_ENABLED"} {
+		if v := env[k]; v != "" && v != "false" {
+			return Config{}, fmt.Errorf("%s must remain false; source capture is blocked", k)
 		}
 	}
-	if len(missing) > 0 {
-		return Config{}, fmt.Errorf("%s is missing %s", path, strings.Join(missing, ", "))
+	if v := env["READ_ONLY"]; v != "" && v != "true" {
+		return Config{}, errors.New("READ_ONLY must remain true")
 	}
-	host, _, err := net.SplitHostPort(c.Listen)
-	if err != nil {
-		return Config{}, fmt.Errorf("LISTEN: %w", err)
-	}
-	if ip := net.ParseIP(host); ip == nil || !ip.IsLoopback() {
-		return Config{}, errors.New("LISTEN must be a loopback address such as 127.0.0.1:7381")
+	c := Config{DataDir: dataDir, Listen: get("LISTEN", "127.0.0.1:7381"), Homeserver: get("MATRIX_HOMESERVER", "http://127.0.0.1:7382"), UserID: get("MATRIX_USER_ID", "@operator:messenger.local"), Password: env["MATRIX_PASSWORD"], BridgeURL: get("BRIDGE_URL", "http://127.0.0.1:7383"), BridgeSecret: env["BRIDGE_PROVISIONING_SECRET"], BridgeBot: get("BRIDGE_BOT", "@metabot:messenger.local"), InternalSecret: env["INTERNAL_SECRET"], MCPToken: env["MCP_TOKEN"], UploadsDir: filepath.Join(dataDir, "uploads"), DownloadsDir: filepath.Join(dataDir, "downloads")}
+	if err := c.Validate(); err != nil {
+		return Config{}, err
 	}
 	return c, nil
 }

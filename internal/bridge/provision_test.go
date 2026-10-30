@@ -61,7 +61,7 @@ func TestBridgeErrorsSurface(t *testing.T) {
 		io.WriteString(w, `{"errcode":"FI.MAU.META_CHECKPOINT","error":"Checkpoint required"}`)
 	})
 	_, err := c.Start(context.Background(), "messenger-android")
-	if err == nil || err.Error() != "bridge: Checkpoint required (FI.MAU.META_CHECKPOINT)" {
+	if err == nil || err.Error() != "bridge: HTTP 400" {
 		t.Fatalf("err=%v", err)
 	}
 	c.Secret = "wrong"

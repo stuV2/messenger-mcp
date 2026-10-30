@@ -60,6 +60,7 @@ func IsPermanent(err error) bool {
 }
 
 type Config struct {
+	WritesEnabled bool // default false: no enqueue, cancellation or worker replay
 	MinGap        time.Duration
 	StatusTimeout time.Duration
 	DailyMax      int
@@ -172,6 +173,12 @@ func ValidateUpload(uploadsDir, path string, maxBytes int64) (string, error) {
 }
 
 func (q *Queue) Enqueue(ctx context.Context, j Job) (JobView, error) {
+	if !q.cfg.WritesEnabled {
+		return JobView{}, errors.New("read-only queue: mutations are disabled")
+	}
+	if len(j.Text) > 16<<10 || len(j.IdempotencyKey) > 256 || len(j.ChatID) > 256 {
+		return JobView{}, errors.New("job exceeds text or identifier limit")
+	}
 	if _, err := q.l.ChatByID(ctx, j.ChatID); err != nil {
 		return JobView{}, fmt.Errorf("unknown chat_id %q", j.ChatID)
 	}
@@ -182,11 +189,7 @@ func (q *Queue) Enqueue(ctx context.Context, j Job) (JobView, error) {
 		}
 		j.FilePath = ""
 	case KindFile:
-		p, err := ValidateUpload(q.cfg.UploadsDir, j.FilePath, q.cfg.MaxFileBytes)
-		if err != nil {
-			return JobView{}, err
-		}
-		j.FilePath = p
+		return JobView{}, errors.New("file sending is disabled until immutable bounded upload snapshots are implemented")
 	default:
 		return JobView{}, fmt.Errorf("unknown kind %q", j.Kind)
 	}
@@ -197,8 +200,11 @@ func (q *Queue) Enqueue(ctx context.Context, j Job) (JobView, error) {
 	}
 	now := q.cfg.Clock().UnixMilli()
 	res, err := q.db.ExecContext(ctx, `INSERT INTO outbox(job_id, idempotency_key, chat_id, kind, text, file_path, status, created_at, updated_at)
-		VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(idempotency_key) DO NOTHING`,
-		jobID, key, j.ChatID, j.Kind, j.Text, j.FilePath, StatusQueued, now, now)
+		SELECT ?,?,?,?,?,?,?,?,? WHERE
+		(SELECT COUNT(*) FROM outbox WHERE status IN ('queued','sending'))<100 AND
+		(SELECT COALESCE(SUM(length(CAST(text AS BLOB))),0) FROM outbox WHERE status IN ('queued','sending'))+length(CAST(? AS BLOB))<=1048576
+		ON CONFLICT(idempotency_key) DO NOTHING`,
+		jobID, key, j.ChatID, j.Kind, j.Text, j.FilePath, StatusQueued, now, now, j.Text)
 	if err != nil {
 		return JobView{}, err
 	}
@@ -208,6 +214,9 @@ func (q *Queue) Enqueue(ctx context.Context, j Job) (JobView, error) {
 	var existingID, chat, kind, text, file string
 	err = q.db.QueryRowContext(ctx, `SELECT job_id, chat_id, kind, text, file_path FROM outbox WHERE idempotency_key=?`, key).
 		Scan(&existingID, &chat, &kind, &text, &file)
+	if errors.Is(err, sql.ErrNoRows) {
+		return JobView{}, errors.New("pending queue capacity exceeded")
+	}
 	if err != nil {
 		return JobView{}, err
 	}
@@ -284,6 +293,9 @@ func (q *Queue) setStatus(ctx context.Context, jobID, from, to, eventID, errText
 }
 
 func (q *Queue) Cancel(ctx context.Context, jobID string) (JobView, error) {
+	if !q.cfg.WritesEnabled {
+		return JobView{}, errors.New("read-only queue: mutations are disabled")
+	}
 	ok, err := q.setStatus(ctx, jobID, StatusQueued, StatusCancelled, "", "")
 	if err != nil {
 		return JobView{}, err
@@ -300,6 +312,9 @@ func (q *Queue) Cancel(ctx context.Context, jobID string) (JobView, error) {
 
 // OnStatus applies a bridge send-status event to the matching job.
 func (q *Queue) OnStatus(u ingest.StatusUpdate) {
+	if !q.cfg.WritesEnabled {
+		return
+	}
 	ctx := context.Background()
 	jobID := u.TxnID
 	if jobID == "" || !q.exists(ctx, jobID) {
@@ -313,9 +328,9 @@ func (q *Queue) OnStatus(u ingest.StatusUpdate) {
 	case event.MessageStatusSuccess:
 		_, _ = q.setStatus(ctx, jobID, StatusSending, StatusSent, "", "")
 	case event.MessageStatusFail:
-		_, _ = q.setStatus(ctx, jobID, StatusSending, StatusFailed, "", "bridge: "+u.Reason)
+		_, _ = q.setStatus(ctx, jobID, StatusSending, StatusFailed, "", "bridge rejected the message; upstream diagnostics withheld")
 	case event.MessageStatusRetriable:
-		_, _ = q.setStatus(ctx, jobID, StatusSending, StatusNeedsReview, "", "bridge (retriable): "+u.Reason)
+		_, _ = q.setStatus(ctx, jobID, StatusSending, StatusNeedsReview, "", "bridge outcome uncertain; upstream diagnostics withheld")
 	}
 }
 
@@ -326,6 +341,9 @@ func (q *Queue) exists(ctx context.Context, jobID string) bool {
 
 // CheckTimeouts moves jobs the bridge never confirmed to needs_review.
 func (q *Queue) CheckTimeouts(ctx context.Context) {
+	if !q.cfg.WritesEnabled {
+		return
+	}
 	cutoff := q.cfg.Clock().Add(-q.cfg.StatusTimeout).UnixMilli()
 	_, _ = q.db.ExecContext(ctx, `UPDATE outbox SET status=?, error='no confirmation from bridge; verify in Messenger before resending', updated_at=?
 		WHERE status=? AND sent_at>0 AND sent_at<?`, StatusNeedsReview, q.cfg.Clock().UnixMilli(), StatusSending, cutoff)
@@ -333,6 +351,9 @@ func (q *Queue) CheckTimeouts(ctx context.Context) {
 
 // Step sends at most one due job. It reports whether a send was attempted.
 func (q *Queue) Step(ctx context.Context) (bool, error) {
+	if !q.cfg.WritesEnabled {
+		return false, nil
+	}
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	now := q.cfg.Clock()
@@ -359,21 +380,29 @@ func (q *Queue) Step(ctx context.Context) (bool, error) {
 		_, err = q.setStatus(ctx, jobID, StatusQueued, StatusFailed, "", "chat no longer known")
 		return false, err
 	}
-	if _, err := q.db.ExecContext(ctx, `UPDATE outbox SET status=?, sent_at=?, updated_at=? WHERE job_id=? AND status=?`,
-		StatusSending, now.UnixMilli(), now.UnixMilli(), jobID, StatusQueued); err != nil {
+	if kind != KindText || len(text) > 16<<10 || q.s == nil {
+		_, err = q.setStatus(ctx, jobID, StatusQueued, StatusFailed, "", "unsupported or oversized queued job; file sending is disabled")
 		return false, err
 	}
+	res, err := q.db.ExecContext(ctx, `UPDATE outbox SET status=?, sent_at=?, updated_at=? WHERE job_id=? AND status=?`,
+		StatusSending, now.UnixMilli(), now.UnixMilli(), jobID, StatusQueued)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if n != 1 {
+		return false, nil
+	} // Cancellation or another claimant won. Never send cached data.
 	q.last = now
 
 	var eventID string
 	var sendErr error
 	for attempt := 1; attempt <= sendAttempts; attempt++ {
 		_, _ = q.db.ExecContext(ctx, `UPDATE outbox SET attempts=? WHERE job_id=?`, attempt, jobID)
-		if kind == KindFile {
-			eventID, sendErr = q.s.SendFile(ctx, chat.RoomID, jobID, file, text)
-		} else {
-			eventID, sendErr = q.s.SendText(ctx, chat.RoomID, jobID, text)
-		}
+		eventID, sendErr = q.s.SendText(ctx, chat.RoomID, jobID, text)
 		if sendErr == nil || IsPermanent(sendErr) {
 			break
 		}
@@ -382,9 +411,9 @@ func (q *Queue) Step(ctx context.Context) (bool, error) {
 	case sendErr == nil:
 		_, err = q.db.ExecContext(ctx, `UPDATE outbox SET event_id=?, updated_at=? WHERE job_id=?`, eventID, now.UnixMilli(), jobID)
 	case IsPermanent(sendErr):
-		_, err = q.setStatus(ctx, jobID, StatusSending, StatusFailed, "", sendErr.Error())
+		_, err = q.setStatus(ctx, jobID, StatusSending, StatusFailed, "", "send rejected; upstream diagnostics withheld")
 	default:
-		_, err = q.setStatus(ctx, jobID, StatusSending, StatusNeedsReview, "", "send outcome unknown: "+sendErr.Error())
+		_, err = q.setStatus(ctx, jobID, StatusSending, StatusNeedsReview, "", "send outcome unknown; verify in Messenger before resending; upstream diagnostics withheld")
 	}
 	return true, err
 }
@@ -407,6 +436,9 @@ func (q *Queue) Wait(ctx context.Context, jobID string, d time.Duration) (JobVie
 
 // Run processes the queue until ctx is cancelled.
 func (q *Queue) Run(ctx context.Context) {
+	if !q.cfg.WritesEnabled {
+		return
+	}
 	t := time.NewTicker(time.Second)
 	defer t.Stop()
 	for {

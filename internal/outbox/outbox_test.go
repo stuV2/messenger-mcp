@@ -76,7 +76,7 @@ func setup(t *testing.T) (*Queue, *fakeSender, *clock, string) {
 	}
 	f := &fakeSender{}
 	c := &clock{now: time.Date(2026, 10, 13, 12, 0, 0, 0, time.UTC)}
-	q, err := New(l, f, Config{MinGap: 10 * time.Second, StatusTimeout: 120 * time.Second, DailyMax: 3, UploadsDir: uploads, MaxFileBytes: 1024, Clock: c.Now})
+	q, err := New(l, f, Config{WritesEnabled: true, MinGap: 10 * time.Second, StatusTimeout: 120 * time.Second, DailyMax: 3, UploadsDir: uploads, MaxFileBytes: 1024, Clock: c.Now})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -131,7 +131,7 @@ func TestStatusByEventIDWithoutTxn(t *testing.T) {
 	}
 	q.OnStatus(ingest.StatusUpdate{EventID: id.EventID("$ev-" + v.JobID), Status: event.MessageStatusFail, Reason: "blocked by Meta"})
 	got, _ := q.Get(context.Background(), v.JobID)
-	if got.Status != StatusFailed || !strings.Contains(got.Error, "blocked by Meta") {
+	if got.Status != StatusFailed || !strings.Contains(got.Error, "upstream diagnostics withheld") {
 		t.Fatalf("permanent failure: %+v", got)
 	}
 }
@@ -259,8 +259,8 @@ func TestEnqueueValidation(t *testing.T) {
 	}
 	ok := filepath.Join(uploads, "presskit.pdf")
 	os.WriteFile(ok, []byte("%PDF"), 0o600)
-	if _, err := q.Enqueue(ctx, Job{ChatID: "245962885415945", Kind: KindFile, FilePath: ok, Text: "press kit"}); err != nil {
-		t.Fatalf("valid upload: %v", err)
+	if _, err := q.Enqueue(ctx, Job{ChatID: "245962885415945", Kind: KindFile, FilePath: ok, Text: "press kit"}); err == nil {
+		t.Fatalf("even a valid upload must be refused until immutable snapshots exist")
 	}
 	outside := filepath.Join(filepath.Dir(uploads), "secret.txt")
 	os.WriteFile(outside, []byte("x"), 0o600)
